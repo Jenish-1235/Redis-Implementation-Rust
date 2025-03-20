@@ -4,3 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+actix-web = "4.10.2"
+tokio = {version = "1.44.1", features = ["full"]}
+dashmap = "5"
+serde = {version = "1", features = ["derive"]}
+serde_json = "1.0.140"
+sys-info = "0.9.1"
