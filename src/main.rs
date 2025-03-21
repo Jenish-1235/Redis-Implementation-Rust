@@ -2,6 +2,7 @@ use std::sync::Arc;
 use actix_web::{http, web, App, HttpResponse, HttpServer};
 use dashmap::DashMap;
 use serde::Deserialize;
+use serde_json::json;
 
 type Data = Arc<DashMap<String, String>>;
 
@@ -46,23 +47,41 @@ async fn main() -> std::io::Result<()> {
 
 
 async fn get_value(query: web::Query<GetQuery> , data: web::Data<Data>) -> HttpResponse {
-    if data.contains_key(&query.key) {
-        HttpResponse::Ok().content_type("application/json").body(format!("status: {} , key: {}, value: {}", "OK", query.key.clone(), data.get(&query.key).unwrap().clone()))
-    }else if !data.contains_key(&query.key) {
-        HttpResponse::Ok().content_type("application/json").body(format!("status: {} , message: {}", "ERROR", "Key not found."))
-    }else{
-        HttpResponse::BadRequest().content_type("application/json").body(format!("status: {} , message: {}", "ERROR", "Error description explaining what went wrong."))
+    match data.get(&query.key) {
+        Some(value) => {
+            HttpResponse::Ok().json(json!({
+                "status": "OK",
+                "key": query.key,
+                "value": value.clone(),
+            }))
+        }
+        None => {
+            HttpResponse::NotFound().json(json!({
+                "status": "ERROR",
+                "message": "Key not found.",
+            }))
+        }
     }
 }
 
 async fn set_value(req: web::Json<PutRequest> , data: web::Data<Arc<DashMap<String, String>>>) -> HttpResponse {
-    if data.contains_key(&req.key) {
-        data.insert(req.0.key.clone(), req.0.value.clone());
-        HttpResponse::Ok().content_type("application/json").body(format!("status: {}, message: {}", "OK", "Key updated successfully."))
-    }else if !data.contains_key(&req.key) {
-        data.insert(req.0.key.clone(), req.0.value.clone());
-        HttpResponse::Ok().content_type("application/json").body(format!("status: {}, message: {}", "OK", "Key inserted successfully."))
+    let key_exists = data.contains_key(&req.key);
+
+    data.insert(req.key.clone(), req.value.clone());
+    let response = json!({
+        "status": "OK",
+        "message": if key_exists {
+            "Key updated successfully."
+        } else{
+            "Key inserted successfully."
+        }
+    });
+
+    let status_code = if key_exists {
+        http::StatusCode::OK
     }else{
-        HttpResponse::build(http::StatusCode::CREATED).content_type("application/json").body(format!("status: {}, message: {}", "ERROR", "Error"))
-    }
+        http::StatusCode::CREATED
+    };
+
+    HttpResponse::build(status_code).json(response)
 }
