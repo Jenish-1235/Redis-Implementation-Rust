@@ -1,87 +1,84 @@
-use axum::{routing::{get, post}, Json, Router, extract::{Query, State}};
+use tokio::{net::TcpListener, io::{AsyncReadExt, AsyncWriteExt}, sync::Mutex};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use tokio::net::TcpListener;
-use hyper::StatusCode;
+use std::{sync::Arc, str};
 
-// Define request and response structures
-#[derive(Deserialize)]
-struct KeyValue {
+#[derive(Serialize, Deserialize, Debug)]
+struct Request {
     key: String,
-    value: String,
-}
-
-#[derive(Serialize)]
-struct Response {
-    status: String,
-    message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     value: Option<String>,
 }
 
-// In-memory key-value store
-type Store = Arc<DashMap<String, String>>;
-
-// Handle POST requests (Insert/Update Key-Value)
-async fn insert_kv(State(store): State<Store>, Json(payload): Json<KeyValue>) -> (StatusCode, Json<Response>) {
-    if payload.key.len() > 256 || payload.value.len() > 256 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(Response {
-                status: "ERROR".to_string(),
-                message: "Key or value exceeds 256 characters.".to_string(),
-                key: None,
-                value: None,
-            }),
-        );
-    }
-    store.insert(payload.key.clone(), payload.value.clone());
-    (StatusCode::OK, Json(Response {
-        status: "OK".to_string(),
-        message: "Key inserted/updated successfully.".to_string(),
-        key: None,
-        value: None,
-    }))
+#[derive(Serialize, Deserialize, Debug)]
+struct Response {
+    status: String,
+    message: String,
+    key: Option<String>,
+    value: Option<String>,
 }
 
-// Handle GET requests (Retrieve Value by Key)
-async fn get_kv(State(store): State<Store>, Query(params): Query<std::collections::HashMap<String, String>>) -> (StatusCode, Json<Response>) {
-    if let Some(key) = params.get("key") {
-        if let Some(value) = store.get(key) {
-            return (StatusCode::OK, Json(Response {
-                status: "OK".to_string(),
-                message: "".to_string(),
-                key: Some(key.clone()),
-                value: Some(value.clone()),
-            }));
-        }
-        return (StatusCode::OK, Json(Response {
-            status: "OK".to_string(),
-            message: "Key not found.".to_string(),
-            key: None,
-            value: None,
-        }));
-    }
-    (StatusCode::BAD_REQUEST, Json(Response {
-        status: "ERROR".to_string(),
-        message: "Missing 'key' parameter.".to_string(),
-        key: None,
-        value: None,
-    }))
-}
-
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::main]
 async fn main() {
     let store = Arc::new(DashMap::new());
-    let app = Router::new()
-        .route("/set", post(insert_kv))
-        .route("/get", get(get_kv))
-        .with_state(store.clone());
-
     let listener = TcpListener::bind("0.0.0.0:7171").await.unwrap();
-    println!("🚀 HTTP Server running on 0.0.0.0:7171 with Tokio multi-threaded runtime");
-    axum::serve(listener, app.into_make_service()).await.unwrap();
+    println!("🚀 TCP Server running on 0.0.0.0:7171");
+
+    loop {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let store = store.clone();
+
+        tokio::spawn(async move {
+            let mut buffer = vec![0; 1024];
+            loop {
+                match socket.read(&mut buffer).await {
+                    Ok(0) => break,  // Connection closed
+                    Ok(size) => {
+                        if let Ok(req_str) = str::from_utf8(&buffer[..size]) {
+                            match serde_json::from_str::<Request>(req_str) {
+                                Ok(request) => {
+                                    let response = if let Some(value) = request.value {
+                                        store.insert(request.key.clone(), value);
+                                        Response {
+                                            status: "OK".to_string(),
+                                            message: "Key inserted/updated successfully.".to_string(),
+                                            key: None,
+                                            value: None,
+                                        }
+                                    } else {
+                                        match store.get(&request.key) {
+                                            Some(value) => Response {
+                                                status: "OK".to_string(),
+                                                message: "".to_string(),
+                                                key: Some(request.key.clone()),
+                                                value: Some(value.clone()),
+                                            },
+                                            None => Response {
+                                                status: "OK".to_string(),
+                                                message: "Key not found.".to_string(),
+                                                key: None,
+                                                value: None,
+                                            },
+                                        }
+                                    };
+                                    let response_str = serde_json::to_string(&response).unwrap();
+                                    let _ = socket.write_all(response_str.as_bytes()).await;
+                                }
+                                Err(_) => {
+                                    let error_response = Response {
+                                        status: "ERROR".to_string(),
+                                        message: "Invalid request format.".to_string(),
+                                        key: None,
+                                        value: None,
+                                    };
+                                    let error_str = serde_json::to_string(&error_response).unwrap();
+                                    let _ = socket.write_all(error_str.as_bytes()).await;
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
 }
