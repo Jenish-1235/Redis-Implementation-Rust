@@ -1,61 +1,111 @@
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
-    task,
-};
-use dashmap::DashMap;
-use std::{sync::Arc, net::SocketAddr};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use lru::LruCache;
+use std::sync::Arc;
+use std::num::NonZeroUsize;
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() {
-    let store = Arc::new(DashMap::new());
-    let listener = TcpListener::bind("0.0.0.0:7171").await.unwrap();
-    println!("🚀 RESP Server running on 0.0.0.0:7171");
+const MEMORY_LIMIT_BYTES: usize = 1_400_000_000;
 
-    loop {
-        let (socket, addr) = listener.accept().await.unwrap();
-        let store = store.clone();
+struct ShardedCache {
+    data: Arc<Mutex<LruCache<String, String>>>,
+}
 
-        task::spawn(handle_client(socket, store, addr));
+impl ShardedCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            data: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(capacity).unwrap()))),
+        }
+    }
+
+    async fn set(&self, key: String, value: String) {
+        let mut cache = self.data.lock().await;
+        cache.put(key, value);
+    }
+
+    async fn get(&self, key: &str) -> Option<String> {
+        let mut cache = self.data.lock().await;
+        cache.get(key).cloned()
     }
 }
 
-async fn handle_client(mut socket: TcpStream, store: Arc<DashMap<String, String>>, addr: SocketAddr) {
-    // Enable TCP_NODELAY
-    socket.set_nodelay(true).unwrap();
+async fn handle_client(mut stream: TcpStream, cache: Arc<ShardedCache>) {
+    let mut buffer = [0; 512];
 
-    let mut buffer = [0; 1024];
-    while let Ok(size) = socket.read(&mut buffer).await {
-        if size == 0 {
+    if let Err(e) = stream.set_nodelay(true) {
+        eprintln!("Failed to set TCP_NODELAY: {}", e);
+        return;
+    }
+
+    while let Ok(bytes_read) = stream.read(&mut buffer).await {
+        if bytes_read == 0 {
             break;
         }
 
-        let request = std::str::from_utf8(&buffer[..size]).unwrap_or("");
-        let response = process_request(request, &store);
-        socket.write_all(response.as_bytes()).await.unwrap();
-    }
+        let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+        let parts: Vec<&str> = request.split("\r\n").collect();
 
-    println!("🔌 Client disconnected: {}", addr);
-}
-
-fn process_request(request: &str, store: &DashMap<String, String>) -> String {
-    let parts: Vec<&str> = request.trim().split_whitespace().collect();
-
-    if parts.is_empty() {
-        return "-ERROR Invalid command\r\n".to_string();
-    }
-
-    match parts[0] {
-        "SET" if parts.len() == 3 => {
-            store.insert(parts[1].to_string(), parts[2].to_string());
-            "+OK\r\n".to_string()
+        if parts.len() < 4 {
+            let _ = stream.write_all(b"-ERR Invalid command\r\n").await;
+            continue;
         }
-        "GET" if parts.len() == 2 => {
-            match store.get(parts[1]) {
-                Some(value) => format!("${}\r\n{}\r\n", value.len(), value),
-                None => "$-1\r\n".to_string(),
+
+        match parts[0] {
+            "*3" if parts[1] == "$3" && parts[2] == "SET" => {
+                if parts.len() >= 6 {
+                    let key = parts[4].to_string();
+                    let value = parts[6].to_string();
+                    cache.set(key, value).await;
+                    let _ = stream.write_all(b"+OK\r\n").await;
+                } else {
+                    let _ = stream.write_all(b"-ERR Invalid SET format\r\n").await;
+                }
+            }
+            "*2" if parts[1] == "$3" && parts[2] == "GET" => {
+                if parts.len() >= 4 {
+                    let key = parts[4].to_string();
+                    if let Some(value) = cache.get(&key).await {
+                        let response = format!("${}\r\n{}\r\n", value.len(), value);
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else {
+                        let _ = stream.write_all(b"$-1\r\n").await;
+                    }
+                } else {
+                    let _ = stream.write_all(b"-ERR Invalid GET format\r\n").await;
+                }
+            }
+            _ => {
+                let _ = stream.write_all(b"-ERR unknown command\r\n").await;
             }
         }
-        _ => "-ERROR Unknown command\r\n".to_string(),
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let cache = Arc::new(ShardedCache::new(100_000)); // Holds 100,000 entries before eviction
+    let listener = TcpListener::bind("0.0.0.0:7171").await.expect("Failed to bind to port 7171");
+
+    println!("🚀 RESP Server running on port 7171");
+
+    let cache_eviction = Arc::clone(&cache);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            let mut cache = cache_eviction.data.lock().await;
+            if cache.len() > 90_000 {
+                cache.pop_lru(); // Evict the least recently used item
+            }
+        }
+    });
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let cache_clone = Arc::clone(&cache);
+                tokio::spawn(handle_client(stream, cache_clone));
+            }
+            Err(e) => eprintln!("Failed to accept connection: {}", e),
+        }
     }
 }
