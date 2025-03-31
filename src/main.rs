@@ -1,14 +1,29 @@
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::{net::TcpListener, io::{AsyncReadExt, AsyncWriteExt}};
 use lru::LruCache;
-use std::sync::Arc;
+use serde::{Deserialize, Serialize};
+use bytes::{Bytes, BytesMut, BufMut};
+use std::{sync::Arc, str};
+use tokio::sync::Mutex;
 use std::num::NonZeroUsize;
 
-const MEMORY_LIMIT_BYTES: usize = 1_400_000_000;
+const MEMORY_LIMIT_BYTES: usize = 1_400_000_000; // 1.4GB limit
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Request {
+    key: String,
+    value: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Response {
+    status: &'static str,
+    message: &'static str,
+    key: Option<String>,
+    value: Option<String>,
+}
 
 struct ShardedCache {
-    data: Arc<Mutex<LruCache<String, String>>>,
+    data: Arc<Mutex<LruCache<String, Bytes>>>,
 }
 
 impl ShardedCache {
@@ -18,81 +33,28 @@ impl ShardedCache {
         }
     }
 
-    async fn set(&self, key: String, value: String) {
+    async fn set(&self, key: String, value: Bytes) {
         let mut cache = self.data.lock().await;
         cache.put(key, value);
     }
 
-    async fn get(&self, key: &str) -> Option<String> {
+    async fn get(&self, key: &str) -> Option<Bytes> {
         let mut cache = self.data.lock().await;
         cache.get(key).cloned()
     }
 }
 
-async fn handle_client(mut stream: TcpStream, cache: Arc<ShardedCache>) {
-    let mut buffer = [0; 512];
-
-    if let Err(e) = stream.set_nodelay(true) {
-        eprintln!("Failed to set TCP_NODELAY: {}", e);
-        return;
-    }
-
-    while let Ok(bytes_read) = stream.read(&mut buffer).await {
-        if bytes_read == 0 {
-            break;
-        }
-
-        let request = String::from_utf8_lossy(&buffer[..bytes_read]);
-        let parts: Vec<&str> = request.split("\r\n").collect();
-
-        if parts.len() < 4 {
-            let _ = stream.write_all(b"-ERR Invalid command\r\n").await;
-            continue;
-        }
-
-        match parts[0] {
-            "*3" if parts[1] == "$3" && parts[2] == "SET" => {
-                if parts.len() >= 6 {
-                    let key = parts[4].to_string();
-                    let value = parts[6].to_string();
-                    cache.set(key, value).await;
-                    let _ = stream.write_all(b"+OK\r\n").await;
-                } else {
-                    let _ = stream.write_all(b"-ERR Invalid SET format\r\n").await;
-                }
-            }
-            "*2" if parts[1] == "$3" && parts[2] == "GET" => {
-                if parts.len() >= 4 {
-                    let key = parts[4].to_string();
-                    if let Some(value) = cache.get(&key).await {
-                        let response = format!("${}\r\n{}\r\n", value.len(), value);
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    } else {
-                        let _ = stream.write_all(b"$-1\r\n").await;
-                    }
-                } else {
-                    let _ = stream.write_all(b"-ERR Invalid GET format\r\n").await;
-                }
-            }
-            _ => {
-                let _ = stream.write_all(b"-ERR unknown command\r\n").await;
-            }
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() {
-    let cache = Arc::new(ShardedCache::new(100_000)); // Holds 100,000 entries before eviction
-    let listener = TcpListener::bind("0.0.0.0:7171").await.expect("Failed to bind to port 7171");
+    let store = Arc::new(ShardedCache::new(100_000)); // 100,000 entries before eviction
+    let listener = TcpListener::bind("0.0.0.0:7171").await.unwrap();
+    println!("🚀 TCP Server running on 0.0.0.0:7171");
 
-    println!("🚀 RESP Server running on port 7171");
-
-    let cache_eviction = Arc::clone(&cache);
+    let store_eviction = Arc::clone(&store);
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-            let mut cache = cache_eviction.data.lock().await;
+            let mut cache = store_eviction.data.lock().await;
             if cache.len() > 90_000 {
                 cache.pop_lru(); // Evict the least recently used item
             }
@@ -100,12 +62,68 @@ async fn main() {
     });
 
     loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let cache_clone = Arc::clone(&cache);
-                tokio::spawn(handle_client(stream, cache_clone));
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let store = store.clone();
+
+        tokio::spawn(async move {
+            let mut buffer = BytesMut::with_capacity(1024);
+
+            if let Err(e) = socket.set_nodelay(true) {
+                eprintln!("Failed to set TCP_NODELAY: {}", e);
+                return;
             }
-            Err(e) => eprintln!("Failed to accept connection: {}", e),
-        }
+
+            loop {
+                buffer.clear();
+                match socket.read_buf(&mut buffer).await {
+                    Ok(0) => break, // Connection closed
+                    Ok(_) => {
+                        if let Ok(req_str) = str::from_utf8(&buffer) {
+                            match serde_json::from_str::<Request>(req_str) {
+                                Ok(request) => {
+                                    let response = if let Some(value) = request.value {
+                                        store.set(request.key.clone(), Bytes::from(value)).await;
+                                        Response {
+                                            status: "OK",
+                                            message: "Key inserted/updated successfully.",
+                                            key: None,
+                                            value: None,
+                                        }
+                                    } else {
+                                        match store.get(&request.key).await {
+                                            Some(value) => Response {
+                                                status: "OK",
+                                                message: "",
+                                                key: Some(request.key.clone()),
+                                                value: Some(String::from_utf8_lossy(&value).to_string()),
+                                            },
+                                            None => Response {
+                                                status: "OK",
+                                                message: "Key not found.",
+                                                key: None,
+                                                value: None,
+                                            },
+                                        }
+                                    };
+                                    let response_str = serde_json::to_string(&response).unwrap();
+                                    let _ = socket.write_all(response_str.as_bytes()).await;
+                                }
+                                Err(_) => {
+                                    let error_response = Response {
+                                        status: "ERROR",
+                                        message: "Invalid request format.",
+                                        key: None,
+                                        value: None,
+                                    };
+                                    let error_str = serde_json::to_string(&error_response).unwrap();
+                                    let _ = socket.write_all(error_str.as_bytes()).await;
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
     }
 }
