@@ -94,7 +94,3 @@ class KeyValueStoreUser(TCPUser):
             response_length=len(json.dumps(response)),
             exception=None if response.get("status") == "OK" else Exception(response.get("message")),
         )
-
-
-# Run Locust with:
-# locust -f locustfile.py --headless -u 100 -r 10 -t 30s
