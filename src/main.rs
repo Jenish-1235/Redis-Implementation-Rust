@@ -73,7 +73,7 @@ async fn get_kv(State(store): State<Store>, Query(params): Query<std::collection
     }))
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
     let store = Arc::new(DashMap::new());
     let app = Router::new()
@@ -82,6 +82,6 @@ async fn main() {
         .with_state(store.clone());
 
     let listener = TcpListener::bind("0.0.0.0:7171").await.unwrap();
-    println!("🚀 HTTP Server running on 0.0.0.0:7171");
+    println!("🚀 HTTP Server running on 0.0.0.0:7171 with Tokio multi-threaded runtime");
     axum::serve(listener, app.into_make_service()).await.unwrap();
 }
