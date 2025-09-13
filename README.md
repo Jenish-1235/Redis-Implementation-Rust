@@ -1,7 +1,3 @@
-Certainly! Here’s a more detailed and explanatory version of your README file. It includes more insight into why each decision was made and the overall rationale behind the optimizations and implementation choices.
-
----
-
 # KV-Cache: High-Performance In-Memory Key-Value Store
 
 ## Overview
